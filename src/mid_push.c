@@ -55,7 +55,7 @@ typedef struct tagPRG
 	long long	total;
 }PROG_S;
 
-void phony_callback(const char *path, long long size, int flag);
+static int brand_progs_regist_init(void);
 
 #define PROGS_NUM 32
 static PROG_S s_prgs[PROGS_NUM];
@@ -66,7 +66,12 @@ static int g_wIndex = 0;
 static int g_rIndex = 0;
 /**************************************/
 
-static int show_rindex = 0;
+/*
+当向push中写数据时才有必要监听进度，否则直接使用数据库中记录的进度即可。
+考虑到缓冲，在无数据后多查询几轮再停止查询，因此push数据时，置此值为3。
+考虑到开机最好给一次显示的机会，初始化为1。
+*/
+static int s_push_has_data = 0;
 
 int send_mpe_sec_to_push_fifo(unsigned char *pkt, int pkt_len)
 {
@@ -141,9 +146,8 @@ int send_mpe_sec_to_push_fifo(unsigned char *pkt, int pkt_len)
 	
 	if (windex==rindex && (g_recvBuffer[windex].len)>0) {
 		rx_fifo_dropped++;
-		if(0==rx_fifo_dropped%500)
+		if(0==(rx_fifo_dropped>>9))	// 每512次打印一次
 			printf("Push FIFO is full. lost pkt count %d, windex %d, len=%d\n", rx_fifo_dropped, windex, g_recvBuffer[windex].len);
-		show_rindex = 1;
 		return res;
 	}
 	
@@ -176,7 +180,8 @@ int send_mpe_sec_to_push_fifo(unsigned char *pkt, int pkt_len)
 	g_recvBuffer[windex].len = pkt_len - 12 - 4 - snap;
 	
 	windex++;
-	windex %= MAX_PACK_BUF;
+	if(windex>=MAX_PACK_BUF)
+		windex -= MAX_PACK_BUF;
 	
 	g_wIndex = windex;
 	
@@ -223,11 +228,8 @@ void *push_decoder_thread()
 			* 调用PUSH数据解析接口解析数据，该函数是阻塞的，所以应该使用一个较大
 			* 的缓冲区来暂时存储源源不断的数据。
 			*/
-//			gettimeofday(&tv_1, NULL);
 			push_parse((char *)pBuf, g_recvBuffer[rindex].len);
-//			gettimeofday(&tv_2, NULL);
-//			if((tv_2.tv_sec-tv_1.tv_sec)>0 || (tv_2.tv_usec-tv_1.tv_usec)>2000)
-//				printf("kill %ld sec %lld usec, for rindex %d, len %d\n", (tv_2.tv_sec-tv_1.tv_sec), (long long)(tv_2.tv_usec-tv_1.tv_usec), rindex, g_recvBuffer[rindex].len);
+			s_push_has_data = 3;
 			
 			g_recvBuffer[rindex].len = 0;
 			rindex++;
@@ -259,52 +261,73 @@ static void push_progs_process_refresh(char *regist_dir, long long cur_size)
 	sqlite_execute(sqlite_cmd);
 }
 
+/*
+为避免无意义的查询硬盘，应完成下面两个工作：
+1、当节目接收完毕后不应再查询，数据库中记录的是100%
+2、只有UI上进入查看进度的界面后，通知底层去查询，其他时间查询没有意义。
+3、当push无数据后，再轮询若干遍（等待缓冲数据写入硬盘）后就不再轮询。
+*/
 void *push_monitor_thread()
 {
 	int i;
 //	struct ch_state cs[10];
 	int print_count = 0;
 	
+	/*
+	小心，反注册可能导致导致死机。但在两种情况下需要反注册：1、下发新的brand.xml；2、节目下载完毕。
+	*/
+	brand_progs_regist_init();
+	
+	sleep(1);
+	
 	while (1)
 	{
-		/*
-		监测节目接收进度
-		*/
-		for(i=0;; i++)
-		{
-			//循环结束的条件是遇到节目路径为空串时
-			if(strcmp(s_prgs[i].prog_uri, "") == 0)
-			{
-				break;
-			}
-			
+		if(s_push_has_data>0){
 			/*
-			* 获取指定节目的已接收字节大小，可算出百分比
+			监测节目接收进度
 			*/
-			long long rxb = push_dir_get_single(s_prgs[i].prog_uri);
-			
-			if(0==print_count){
-				DEBUG("PROG_S:%s %s %lld/%lld %-3lld%%\n",
-				s_prgs[i].id,
-				s_prgs[i].prog_uri,
-				rxb,
-				s_prgs[i].total,
-				rxb*100/s_prgs[i].total);
-			}
-			
-			if(s_prgs[i].cur != rxb){
-				push_progs_process_refresh(s_prgs[i].prog_uri, rxb);
-			
-				if(rxb>=s_prgs[i].total)
-					push_progs_finish(s_prgs[i].id);
+			for(i=0;; i++)
+			{
+				//循环结束的条件是遇到节目路径为空串时
+				if(strcmp(s_prgs[i].prog_uri, "") == 0)
+				{
+					break;
+				}
 				
-				s_prgs[i].cur = rxb;
+				/*
+				* 获取指定节目的已接收字节大小，可算出百分比
+				*/
+				long long rxb = push_dir_get_single(s_prgs[i].prog_uri);
+				
+				if(0==print_count){
+					DEBUG("PROG_S:%s %s %lld/%lld %-3lld%%\n",
+					s_prgs[i].id,
+					s_prgs[i].prog_uri,
+					rxb,
+					s_prgs[i].total,
+					rxb*100/s_prgs[i].total);
+				}
+				
+				if(s_prgs[i].cur != rxb){
+					push_progs_process_refresh(s_prgs[i].prog_uri, rxb);
+				
+					if(rxb>=s_prgs[i].total)
+						push_progs_finish(s_prgs[i].id);
+					
+					s_prgs[i].cur = rxb;
+				}
+				
+				if(rxb>=s_prgs[i].total){
+					DEBUG("%s download finished, wipe off from monitor\n", s_prgs[i].prog_uri);
+					mid_push_unregist(s_prgs[i].prog_uri);
+				}
 			}
+			
+			print_count ++;
+			if(print_count>=5)
+				print_count = 0;
 		}
-		
-		print_count ++;
-		if(print_count>=5)
-			print_count = 0;
+		s_push_has_data--;
 		
 		sleep(5);
 	}
@@ -351,34 +374,6 @@ int push_data_root_dir_get(char *buf, unsigned int size)
 	strncpy(buf, s_push_data_dir, size);
 	return 0;
 }
-
-/*
-模仿callback函数测试xml解析，非正式代码
-*/
-//void phony_callback(const char *path, long long size, int flag)
-//{
-//	DEBUG("path:%s, size:%lld, flag:%d\n", path, size, flag);
-//	
-//	char xml_absolute_name[256+128];
-//	snprintf(xml_absolute_name, sizeof(xml_absolute_name), "%s/%s", s_push_data_dir, path);
-//	/* 由于涉及到解析和数据库操作，这里不直接调用parseDoc，避免耽误push任务的运行效率 */
-//	// settings/allpid/allpid.xml
-//	if(0==filename_check(path, "allpid.xml") && s_file_updata_flag.allpid!=flag){
-//		mid_msg_send(s_msg_push_monitor_id, 1, xml_absolute_name, strlen(xml_absolute_name));
-//	}
-//	else if(0==filename_check(path, "column.xml")){
-//		mid_msg_send(s_msg_push_monitor_id, 1, xml_absolute_name, strlen(xml_absolute_name));
-//	}
-//	else if(0==filename_check(path, "ProductTag.xml")){
-//		mid_msg_send(s_msg_push_monitor_id, 1, xml_absolute_name, strlen(xml_absolute_name));
-//	}
-//	else if(0==filename_check(path, "brand_0001.xml")){
-//		mid_msg_send(s_msg_push_monitor_id, 1, xml_absolute_name, strlen(xml_absolute_name));
-//	}
-//	else if(0==filename_check(path, "PreProductTag.xml")){
-//		mid_msg_send(s_msg_push_monitor_id, 1, xml_absolute_name, strlen(xml_absolute_name));
-//	}
-//}
 
 /*
 需要确保allpid.xml等关键描述文件在开机后至少解析一次。
@@ -508,6 +503,7 @@ int mid_push_init(char *push_conf)
 		DEBUG("Init push lib failed!\n");
 		return -1;
 	}
+	s_push_has_data = 1;
 	
 	push_set_notice_callback(callback);
 	
@@ -532,12 +528,6 @@ int mid_push_init(char *push_conf)
 		s_prgs[i].cur = 0LL;
 		s_prgs[i].total = 0LL;
 	}
-	
-	/*
-	暂时屏蔽此函数，如果在这里注册，但随后由新的brand.xml下发时，需要反注册。
-	而反注册导致死机。
-	*/
-	brand_progs_regist_init();
 	
 #if 0	
 	mid_push_regist("prog/file", 18816360LL);

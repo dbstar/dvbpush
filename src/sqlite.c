@@ -10,6 +10,7 @@
 #include "common.h"
 #include "sqlite3.h"
 #include "sqlite.h"
+#include "porting.h"
 
 /*数据库必须及时打开、及时关闭，不能采用打开计数器的方式，因为上层应用也可能在使用*/
 
@@ -258,7 +259,7 @@ cname		NVARCHAR(128));");
 			{
 				snprintf(sqlite_cmd,sizeof(sqlite_cmd),\
 					"CREATE TABLE content(\
-id			NVARCHAR(32) PRIMARY KEY,\
+id			NVARCHAR(32),\
 ready		INTEGER,\
 senduser	NVARCHAR(32),\
 sendtime	NVARCHAR(32),\
